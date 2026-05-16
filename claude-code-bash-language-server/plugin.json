@@ -1,0 +1,20 @@
+{
+  "name": "bash-language-server",
+  "version": "0.1.0",
+  "description": "Bash/sh language server integration for Claude Code via bash-language-server.",
+  "author": {
+    "name": "bash-lsp community"
+  },
+  "repository": "https://github.com/bash-lsp/bash-language-server",
+  "license": "MIT",
+  "keywords": [
+    "bash",
+    "shell",
+    "sh",
+    "zsh",
+    "lsp",
+    "language-server",
+    "shellcheck",
+    "shfmt"
+  ]
+}
