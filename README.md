@@ -1,5 +1,10 @@
 # Bash Language Server
 
+## Claude Code Bash-agent scaffold
+
+This packaged variant includes Claude Code LSP scaffolding plus optional ShellCheck/shfmt post-edit hooks and a `/bash-language-server:bash-safe-edit` skill. See [`CLAUDE_CODE_LSP.md`](CLAUDE_CODE_LSP.md) for install, safety notes, and smoke tests.
+
+
 Bash language server that brings an IDE-like experience for bash scripts to most editors. This is based on the [Tree Sitter parser][tree-sitter-bash] and supports [explainshell][explainshell], [shellcheck][shellcheck] and [shfmt][shfmt].
 
 Documentation around configuration variables can be found in the [config.ts](https://github.com/bash-lsp/bash-language-server/blob/main/server/src/config.ts) file.
@@ -228,4 +233,4 @@ Please see [docs/development-guide][dev-guide] for more information.
 
 ## Claude Code LSP scaffold
 
-This fork just includes a minimal Claude Code LSP marketplace scaffold under `.claude-plugin/marketplace.json` and `claude-code-bash-language-server/`. See [`CLAUDE_CODE_LSP.md`](./CLAUDE_CODE_LSP.md) for installation and operational notes.
+This packaged copy includes a minimal Claude Code LSP marketplace scaffold under `.claude-plugin/marketplace.json` and `claude-code-bash-language-server/`. See [`CLAUDE_CODE_LSP.md`](./CLAUDE_CODE_LSP.md) for installation and operational notes.
