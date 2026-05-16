@@ -1,0 +1,22 @@
+{
+  "bash": {
+    "command": "bash-language-server",
+    "args": [
+      "start"
+    ],
+    "transport": "stdio",
+    "extensionToLanguage": {
+      ".bash": "shellscript",
+      ".bats": "shellscript",
+      ".command": "shellscript",
+      ".inc": "shellscript",
+      ".sh": "shellscript",
+      ".zsh": "shellscript"
+    },
+    "initializationOptions": {},
+    "settings": {},
+    "startupTimeout": 60000,
+    "shutdownTimeout": 15000,
+    "maxRestarts": 3
+  }
+}
