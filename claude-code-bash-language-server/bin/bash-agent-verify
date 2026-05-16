@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# Verify shell scripts for agent workflows.
+# - Optional shfmt formatting
+# - bash -n / zsh -n syntax checks
+# - shellcheck static diagnostics when available
+# The script does not execute target shell scripts.
+set -u
+
+HOOK=0
+FORMAT=0
+CHANGED=0
+ALL=0
+files=()
+
+usage() {
+  cat <<'EOF'
+Usage: bash-agent-verify [--format] [--changed | --all | FILE ...]
+
+Options:
+  --format   Apply shfmt -w before verification. Skipped for .zsh files.
+  --changed  Verify changed/untracked shell files in the current git worktree.
+  --all      Verify shell-looking files under the current directory.
+  --hook     Emit Claude Code PostToolUse hook JSON. Intended for internal use.
+
+Environment:
+  BASH_AGENT_SHFMT_ARGS="-i 2 -ci"        Extra shfmt args, split on whitespace.
+  BASH_AGENT_SHELLCHECK_ARGS="--severity=warning"
+  BASH_AGENT_SHELLCHECK_EXTERNAL_SOURCES=1  Add shellcheck -x.
+  BASH_AGENT_MAX_OUTPUT_CHARS=8000          Hook output cap; default 8000.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --hook) HOOK=1 ;;
+    --format) FORMAT=1 ;;
+    --changed) CHANGED=1 ;;
+    --all) ALL=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; files+=("$@"); break ;;
+    -*) echo "Unknown option: $1" >&2; usage >&2; exit 64 ;;
+    *) files+=("$1") ;;
+  esac
+  shift
+done
+
+is_shell_file() {
+  local f=$1 base
+  base=$(basename -- "$f")
+  case "$base" in
+    .bashrc|.bash_profile|.bash_login|.profile|.envrc|bashrc|bash_profile) return 0 ;;
+  esac
+  case "$f" in
+    *.sh|*.bash|*.bats|*.command|*.inc|*.zsh) return 0 ;;
+  esac
+  if [ -f "$f" ]; then
+    local first
+    IFS= read -r first < "$f" || true
+    case "$first" in
+      '#!'*bash*|'#!'*'/sh'*|'#!'*zsh*|'#!'*bats*) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+is_zsh_file() {
+  local f=$1 first
+  case "$f" in *.zsh) return 0 ;; esac
+  if [ -f "$f" ]; then
+    IFS= read -r first < "$f" || true
+    case "$first" in '#!'*zsh*) return 0 ;; esac
+  fi
+  return 1
+}
+
+relpath() {
+  local f=$1
+  case "$f" in
+    "$PWD"/*) printf '%s' "${f#"$PWD"/}" ;;
+    *) printf '%s' "$f" ;;
+  esac
+}
+
+emit_hook_json() {
+  local failed=$1
+  local msg=$2
+  local max_chars=${BASH_AGENT_MAX_OUTPUT_CHARS:-8000}
+  if [ "${#msg}" -gt "$max_chars" ] 2>/dev/null; then
+    msg="${msg:0:$max_chars}
+... output truncated by bash-agent-verify ..."
+  fi
+  FAILED="$failed" MSG="$msg" node -e '
+const failed = process.env.FAILED === "1";
+const msg = process.env.MSG || "";
+const payload = {
+  hookSpecificOutput: {
+    hookEventName: "PostToolUse"
+  }
+};
+if (msg) payload.hookSpecificOutput.additionalContext = msg;
+if (failed) {
+  payload.decision = "block";
+  payload.reason = msg || "Bash verification failed.";
+}
+console.log(JSON.stringify(payload));
+'
+}
+
+collect_changed_files() {
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    {
+      git diff --name-only --diff-filter=ACMR HEAD -- 2>/dev/null || true
+      git ls-files --others --exclude-standard 2>/dev/null || true
+    } | while IFS= read -r f; do
+      [ -n "$f" ] && [ -f "$f" ] && is_shell_file "$f" && printf '%s\n' "$f"
+    done | sort -u
+  fi
+}
+
+collect_all_files() {
+  find . \
+    -path './.git' -prune -o \
+    -path './node_modules' -prune -o \
+    -type f \( \
+      -name '*.sh' -o -name '*.bash' -o -name '*.bats' -o -name '*.command' -o -name '*.inc' -o -name '*.zsh' -o \
+      -name '.bashrc' -o -name '.bash_profile' -o -name '.bash_login' -o -name '.profile' -o -name '.envrc' \
+    \) -print
+}
+
+if [ "$CHANGED" -eq 1 ]; then
+  while IFS= read -r f; do files+=("$f"); done < <(collect_changed_files)
+fi
+
+if [ "$ALL" -eq 1 ]; then
+  while IFS= read -r f; do files+=("$f"); done < <(collect_all_files)
+fi
+
+if [ "${#files[@]}" -eq 0 ]; then
+  if [ "$HOOK" -eq 1 ]; then exit 0; fi
+  echo "No files selected. Pass FILE paths, --changed, or --all." >&2
+  exit 64
+fi
+
+# De-duplicate while preserving order.
+unique_files=()
+seen=$'\n'
+for f in "${files[@]}"; do
+  [ -n "$f" ] || continue
+  case "$seen" in *$'\n'"$f"$'\n'*) continue ;; esac
+  seen+="$f"$'\n'
+  unique_files+=("$f")
+done
+
+failed=0
+changed=0
+messages=()
+manual_notes=()
+
+verify_one() {
+  local file=$1 display checker syntax_out shellcheck_out shfmt_out before after
+  [ -f "$file" ] || return 0
+  is_shell_file "$file" || return 0
+  display=$(relpath "$file")
+
+  if [ "$FORMAT" -eq 1 ] && ! is_zsh_file "$file"; then
+    if command -v shfmt >/dev/null 2>&1; then
+      before=$(cksum < "$file" 2>/dev/null || true)
+      # shellcheck disable=SC2206
+      local shfmt_args=( ${BASH_AGENT_SHFMT_ARGS:-} )
+      shfmt_out=$(shfmt "${shfmt_args[@]}" -w -- "$file" 2>&1)
+      local rc=$?
+      if [ "$rc" -ne 0 ]; then
+        failed=1
+        messages+=("shfmt failed for $display:
+$shfmt_out")
+      else
+        after=$(cksum < "$file" 2>/dev/null || true)
+        if [ "$before" != "$after" ]; then
+          changed=1
+          messages+=("shfmt reformatted $display")
+        fi
+      fi
+    elif [ "$HOOK" -eq 0 ]; then
+      manual_notes+=("shfmt not found; skipped formatting for $display")
+    fi
+  fi
+
+  if is_zsh_file "$file"; then
+    if command -v zsh >/dev/null 2>&1; then
+      syntax_out=$(zsh -n -- "$file" 2>&1)
+      local rc=$?
+      if [ "$rc" -ne 0 ]; then
+        failed=1
+        messages+=("zsh -n failed for $display:
+$syntax_out")
+      fi
+    elif [ "$HOOK" -eq 0 ]; then
+      manual_notes+=("zsh not found; skipped zsh syntax check for $display")
+    fi
+  else
+    if command -v bash >/dev/null 2>&1; then
+      syntax_out=$(bash -n -- "$file" 2>&1)
+      local rc=$?
+      if [ "$rc" -ne 0 ]; then
+        failed=1
+        messages+=("bash -n failed for $display:
+$syntax_out")
+      fi
+    elif [ "$HOOK" -eq 0 ]; then
+      manual_notes+=("bash not found; skipped Bash syntax check for $display")
+    fi
+  fi
+
+  if ! is_zsh_file "$file"; then
+    if command -v shellcheck >/dev/null 2>&1; then
+      # shellcheck disable=SC2206
+      local shellcheck_args=( ${BASH_AGENT_SHELLCHECK_ARGS:-} )
+      if [ "${BASH_AGENT_SHELLCHECK_EXTERNAL_SOURCES:-0}" = "1" ]; then
+        shellcheck_args+=("-x")
+      fi
+      shellcheck_out=$(shellcheck "${shellcheck_args[@]}" -- "$file" 2>&1)
+      local rc=$?
+      if [ "$rc" -ne 0 ]; then
+        failed=1
+        messages+=("shellcheck failed for $display:
+$shellcheck_out")
+      fi
+    elif [ "$HOOK" -eq 0 ]; then
+      manual_notes+=("shellcheck not found; skipped static analysis for $display")
+    fi
+  elif [ "$HOOK" -eq 0 ]; then
+    manual_notes+=("shellcheck skipped for $display because it is a zsh script")
+  fi
+}
+
+for f in "${unique_files[@]}"; do
+  verify_one "$f"
+done
+
+summary=""
+if [ "${#messages[@]}" -gt 0 ]; then
+  summary=$(printf '%s\n\n' "${messages[@]}")
+fi
+if [ "${#manual_notes[@]}" -gt 0 ] && [ "$HOOK" -eq 0 ]; then
+  summary+=$(printf '%s\n' "${manual_notes[@]}")
+fi
+
+if [ "$HOOK" -eq 1 ]; then
+  if [ "$failed" -eq 1 ]; then
+    emit_hook_json 1 "Bash verification found issues after editing a shell script. Fix these before continuing:
+
+$summary"
+    exit 0
+  fi
+  if [ "$changed" -eq 1 ]; then
+    emit_hook_json 0 "Bash post-edit verification: shfmt reformatted the edited shell script. Re-read the file before making additional nearby edits if exact formatting context matters.
+
+$summary"
+    exit 0
+  fi
+  exit 0
+fi
+
+if [ -n "$summary" ]; then
+  printf '%s\n' "$summary"
+fi
+
+if [ "$failed" -eq 1 ]; then
+  exit 1
+fi
+
+echo "bash-agent-verify: OK (${#unique_files[@]} file(s) considered)."
+exit 0
